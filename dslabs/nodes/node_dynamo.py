@@ -31,11 +31,12 @@ class NodeDynamo:
     successful_writes: set[str] = field(default_factory=set)
 
     # Client-facing API
-    def client_put(self, key: str, value: Any) -> None:
+    def client_put(self, key: str, value: Any) -> str:
         # Register the write request with Node_ID and ID
         self.request_counter += 1
         request_id = f"{self.node_id}:{self.request_counter}"
         self.receive_and_replicate(request_id, key, value)
+        return request_id
 
     def client_get(self, key: str) -> Any:
         return self.store.get(key)
