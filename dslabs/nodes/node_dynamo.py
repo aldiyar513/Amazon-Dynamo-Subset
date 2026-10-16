@@ -29,6 +29,10 @@ class NodeDynamo:
     pending_writes: dict[str, set[str]] = field(default_factory=dict)
 
     successful_writes: set[str] = field(default_factory=set)
+    # write time outs 
+    write_timeout_ms: int = 500 
+
+    timed_out_writes: set[str] = field(default_factory=set)
 
     # Client-facing API
     def client_put(self, key: str, value: Any) -> str:
@@ -46,6 +50,10 @@ class NodeDynamo:
         # Write the Request then count it 
         self.receive(key, value)
         self.pending_writes[request_id] = {self.node_id}
+        self.scheduler.call_later(
+                    self.write_timeout_ms,
+                    lambda: self.on_write_timeout(request_id),
+                )
         if len(self.pending_writes[request_id]) >= self.write_quorum:
             del self.pending_writes[request_id]
             self.successful_writes.add(request_id)
@@ -76,6 +84,12 @@ class NodeDynamo:
                     self.successful_writes.add(msg["request_id"])
         else:
             raise ValueError(f"Unknown message type in {msg!r}")
+        
+
+    def on_write_timeout(self, request_id: str) -> None:
+        if request_id in self.pending_writes:
+            del self.pending_writes[request_id]
+            self.timed_out_writes.add(request_id)
 
     # What the trace and diagrams show as this node's state
     def brief_state(self) -> dict[str, Any]:
