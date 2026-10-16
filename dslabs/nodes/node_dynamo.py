@@ -46,6 +46,9 @@ class NodeDynamo:
         # Write the Request then count it 
         self.receive(key, value)
         self.pending_writes[request_id] = {self.node_id}
+        if len(self.pending_writes[request_id]) >= self.write_quorum:
+            del self.pending_writes[request_id]
+            self.successful_writes.add(request_id)
         for peer in self.peers:
             if peer != self.node_id:
                 self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id})
