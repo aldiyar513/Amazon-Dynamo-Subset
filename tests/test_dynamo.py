@@ -131,3 +131,95 @@ def test_write_times_out_when_quorum_unreachable():
     assert nodes["A"].store["cart:42"] == {"book": 2}
     assert "cart:42" not in nodes["B"].store
     assert "cart:42" not in nodes["C"].store
+
+def make_read_cluster(read_quorum=2):
+    scheduler = SimScheduler()
+    network = SimNetwork(
+        scheduler, seed=0, latency_ms=(30, 80)
+    )
+    node_ids = ["A", "B", "C"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            read_quorum=read_quorum,
+            read_timeout_ms=500,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    return scheduler, network, nodes
+
+
+def test_read_reaches_quorum():
+    scheduler, network, nodes = make_read_cluster()
+
+    # First replicate the cart to all nodes
+    nodes["A"].client_put("cart:42", {"book": 2})
+    scheduler.run_until(1000)
+
+    request_id = nodes["A"].client_get("cart:42")
+
+    # Only A's local response exists initially
+    assert nodes["A"].pending_reads[request_id] == {
+        "A": {"book": 2}
+    }
+    assert request_id not in nodes["A"].completed_reads
+
+    scheduler.run_until(2000)
+
+    responses = nodes["A"].completed_reads[request_id]
+    assert len(responses) == 2
+    assert "A" in responses
+    assert all(value == {"book": 2} for value in responses.values())
+    assert request_id not in nodes["A"].pending_reads
+    assert request_id not in nodes["A"].timed_out_reads
+
+
+def test_read_quorum_one_succeeds_immediately():
+    scheduler, network, nodes = make_read_cluster(read_quorum=1)
+
+    nodes["A"].client_put("cart:42", {"book": 2})
+    scheduler.run_until(1000)
+
+    network.add_rule(partition({"A"}))
+    request_id = nodes["A"].client_get("cart:42")
+
+    # Completes without running the scheduler again
+    assert nodes["A"].completed_reads[request_id] == {
+        "A": {"book": 2}
+    }
+    assert request_id not in nodes["A"].pending_reads
+
+    scheduler.run_until(2000)
+    assert request_id not in nodes["A"].timed_out_reads
+
+
+def test_read_times_out_when_quorum_unreachable():
+    scheduler, network, nodes = make_read_cluster()
+
+    nodes["A"].client_put("cart:42", {"book": 2})
+    scheduler.run_until(1000)
+
+    network.add_rule(partition({"A"}))
+    request_id = nodes["A"].client_get("cart:42")
+
+    # Read started at 1000 ms, so its deadline is 1500 ms
+    scheduler.run_until(1499)
+    assert nodes["A"].pending_reads[request_id] == {
+        "A": {"book": 2}
+    }
+    assert request_id not in nodes["A"].timed_out_reads
+    assert request_id not in nodes["A"].completed_reads
+
+    scheduler.run_until(1500)
+    assert request_id in nodes["A"].timed_out_reads
+    assert request_id not in nodes["A"].pending_reads
+    assert request_id not in nodes["A"].completed_reads
+
+    # Reading and timing out do not change stored data
+    assert nodes["A"].store["cart:42"] == {"book": 2}
