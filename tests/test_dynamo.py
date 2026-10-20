@@ -223,3 +223,41 @@ def test_read_times_out_when_quorum_unreachable():
 
     # Reading and timing out do not change stored data
     assert nodes["A"].store["cart:42"] == {"book": 2}
+
+
+def test_store_survives_node_restart(tmp_path):
+    storage_path = str(tmp_path / "A.json")
+
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0)
+
+    node = NodeDynamo(
+        node_id="A",
+        peers=["A"],
+        transport=network.endpoint("A"),
+        scheduler=scheduler,
+        write_quorum=1,
+        storage_path=storage_path,
+    )
+
+    assert node.store == {}
+
+    request_id = node.client_put("cart:42", {"book": 2})
+
+    assert request_id in node.successful_writes
+    assert (tmp_path / "A.json").exists()
+
+    # Restart the node and check that the store is loaded from disk
+    new_scheduler = SimScheduler()
+    new_network = SimNetwork(new_scheduler, seed=0)
+
+    restarted_node = NodeDynamo(
+        node_id="A",
+        peers=["A"],
+        transport=new_network.endpoint("A"),
+        scheduler=new_scheduler,
+        write_quorum=1,
+        storage_path=storage_path,
+    )
+
+    assert restarted_node.store == {"cart:42": {"book": 2}}

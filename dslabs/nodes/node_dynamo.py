@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any
-
+import json
 from dslabs.protocols import Message, Scheduler, Transport
 
 
@@ -41,6 +41,8 @@ class NodeDynamo:
     read_quorum: int = 2
     pending_reads: dict[str, dict[str, Any]] = field(default_factory=dict)
     completed_reads: dict[str, dict[str, Any]] = field(default_factory=dict)
+    
+    storage_path: str | None = None
 
     # Client-facing API
     def client_put(self, key: str, value: Any) -> str:
@@ -96,6 +98,7 @@ class NodeDynamo:
         """Apply a message to this node: update the store, append to the log."""
         self.store[key] = value
         self.log.append((key, value))
+        self.save_store()
 
     # Network handler
     def on_message(self, msg: Message) -> None:
@@ -121,7 +124,7 @@ class NodeDynamo:
         else:
             raise ValueError(f"Unknown message type in {msg!r}")
         
-
+    
     def on_write_timeout(self, request_id: str) -> None:
         if request_id in self.pending_writes:
             del self.pending_writes[request_id]
@@ -135,4 +138,22 @@ class NodeDynamo:
     # What the trace and diagrams show as this node's state
     def brief_state(self) -> dict[str, Any]:
         return dict(self.store)
-    
+    def save_store(self) -> None:
+        # Write to the store path to the file as well 
+        if self.storage_path:
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump(self.store, f)
+        else: 
+            return 
+    def load_store(self) -> None:
+        # Read from the file 
+        if self.storage_path:
+            try:
+                with open(self.storage_path, "r", encoding="utf-8") as f:
+                    self.store = json.load(f)
+            except FileNotFoundError:
+                pass
+        else: 
+            return
+    def __post_init__(self) -> None:
+        self.load_store()
