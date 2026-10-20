@@ -261,3 +261,47 @@ def test_store_survives_node_restart(tmp_path):
     )
 
     assert restarted_node.store == {"cart:42": {"book": 2}}
+
+
+def test_replica_restores_data_after_restart(tmp_path):
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(30, 80))
+
+    node_ids = ["A", "B"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            write_quorum=2,
+            storage_path=str(tmp_path / f"{node_id}.json"),
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    # Only A receives a client write. B receives it through replication.
+    request_id = nodes["A"].client_put("cart:42", {"book": 2})
+    scheduler.run_until(1000)
+
+    assert request_id in nodes["A"].successful_writes
+    assert nodes["B"].store == {"cart:42": {"book": 2}}
+    assert (tmp_path / "B.json").exists()
+
+    # Recreate B in a fresh simulator, using its saved file.
+    new_scheduler = SimScheduler()
+    new_network = SimNetwork(new_scheduler, seed=0)
+
+    restarted_node = NodeDynamo(
+        node_id="B",
+        peers=node_ids,
+        transport=new_network.endpoint("B"),
+        scheduler=new_scheduler,
+        storage_path=str(tmp_path / "B.json"),
+    )
+
+    # No messages have been delivered in this new simulator.
+    # B must have restored this data from its file.
+    assert restarted_node.store == {"cart:42": {"book": 2}}
