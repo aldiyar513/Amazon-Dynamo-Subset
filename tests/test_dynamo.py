@@ -305,3 +305,89 @@ def test_replica_restores_data_after_restart(tmp_path):
     # No messages have been delivered in this new simulator.
     # B must have restored this data from its file.
     assert restarted_node.store == {"cart:42": {"book": 2}}
+
+
+def test_gossip_merges_known_members():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0)
+
+    node = NodeDynamo(
+        node_id="A",
+        peers=["B"],
+        transport=network.endpoint("A"),
+        scheduler=scheduler,
+    )
+
+    assert node.known_members == {"A", "B"}
+
+    node.on_message({
+        "type": "gossip",
+        "members": ["B", "C"],
+    })
+
+    assert node.known_members == {"A", "B", "C"}
+
+def test_periodic_gossip_spreads_membership(monkeypatch):
+    monkeypatch.setattr("random.choice", lambda candidates: candidates[0])
+
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(10, 10))
+
+    initial_peers = {
+        "A": ["B"],
+        "B": ["C"],
+        "C": ["A"],
+    }
+    nodes = {}
+
+    for node_id, peers in initial_peers.items():
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=peers,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            gossip_interval_ms=1000,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    # Before the first tick, nobody has learned anything new.
+    scheduler.run_until(999)
+
+    assert nodes["A"].known_members == {"A", "B"}
+    assert nodes["B"].known_members == {"B", "C"}
+    assert nodes["C"].known_members == {"A", "C"}
+
+    # The first tick sends at 1000 ms; delivery happens at 1010 ms.
+    scheduler.run_until(1010)
+
+    for node in nodes.values():
+        assert node.known_members == {"A", "B", "C"}
+
+    # A second round confirms that gossip reschedules itself.
+    sent_after_first_round = network.stats["sent"]
+    assert sent_after_first_round == 3
+
+    scheduler.run_until(2010)
+
+    assert network.stats["sent"] == sent_after_first_round + 3
+
+def test_gossip_with_no_other_members():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0)
+
+    node = NodeDynamo(
+        node_id="A",
+        peers=[],
+        transport=network.endpoint("A"),
+        scheduler=scheduler,
+        gossip_interval_ms=1000,
+    )
+    network.register("A", node.on_message)
+
+    scheduler.run_until(3000)
+
+    assert node.known_members == {"A"}
+    assert network.stats["sent"] == 0
+
+

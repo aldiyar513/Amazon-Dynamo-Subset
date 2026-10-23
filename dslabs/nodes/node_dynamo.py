@@ -44,6 +44,10 @@ class NodeDynamo:
     
     storage_path: str | None = None
 
+    known_members: set[str] = field(default_factory=set)
+
+    gossip_interval_ms: int = 1000
+
     # Client-facing API
     def client_put(self, key: str, value: Any) -> str:
         # Register the write request with Node_ID and ID
@@ -121,6 +125,8 @@ class NodeDynamo:
                 if len(self.pending_reads[msg["request_id"]]) >= self.read_quorum:
                     self.completed_reads[msg["request_id"]] = self.pending_reads[msg["request_id"]]
                     del self.pending_reads[msg["request_id"]]
+        elif msg["type"] == "gossip":
+            self.known_members.update(msg["members"])
         else:
             raise ValueError(f"Unknown message type in {msg!r}")
         
@@ -155,5 +161,22 @@ class NodeDynamo:
                 pass
         else: 
             return
+    def gossip_once(self) -> None:
+        import random 
+        members = sorted(list(self.known_members))
+        recipients = [member for member in members if member != self.node_id]
+        if recipients:
+            # Pick a random member to gossip to
+            recipient = random.choice(recipients)
+            self.transport.send(recipient, {"type": "gossip", "members": members})
+        else:
+            return 
+    def on_gossip_tick(self) -> None:
+        self.gossip_once()
+        self.scheduler.call_later(self.gossip_interval_ms, self.on_gossip_tick)
+
     def __post_init__(self) -> None:
         self.load_store()
+        self.known_members.add(self.node_id)
+        self.known_members.update(self.peers)
+        self.scheduler.call_later(self.gossip_interval_ms, self.on_gossip_tick)
