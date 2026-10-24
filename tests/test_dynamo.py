@@ -391,3 +391,53 @@ def test_gossip_with_no_other_members():
     assert network.stats["sent"] == 0
 
 
+def test_gossip_spreads_membership_after_partition_heals(monkeypatch):
+    choices = {}
+
+    def choose_next(candidates):
+        key = tuple(candidates)
+        index = choices.get(key, 0)
+        choices[key] = index + 1
+        return candidates[index % len(candidates)]
+
+    monkeypatch.setattr("random.choice", choose_next)
+
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(10, 10))
+
+    initial_peers = {
+        "A": ["B"],
+        "B": ["A"],
+        "C": ["B"],
+    }
+    nodes = {}
+
+    for node_id, peers in initial_peers.items():
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=peers,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            gossip_interval_ms=1000,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    # Block communication between C and the other nodes.
+    cut = partition({"C"})
+    network.add_rule(cut)
+
+    scheduler.run_until(3000)
+
+    assert nodes["A"].known_members == {"A", "B"}
+    assert nodes["B"].known_members == {"A", "B"}
+    assert nodes["C"].known_members == {"B", "C"}
+
+    # Restore communication and allow periodic gossip to continue.
+    network.remove_rule(cut)
+    scheduler.run_until(10000)
+
+    for node in nodes.values():
+        assert node.known_members == {"A", "B", "C"}
+
+
