@@ -48,6 +48,12 @@ class NodeDynamo:
 
     gossip_interval_ms: int = 1000
 
+    last_seen: dict[str, int] = field(default_factory=dict)
+    suspected_nodes: set[str] = field(default_factory=set)
+    failure_timeout_ms: int = 3000
+
+    health_check_interval_ms: int = 1000
+
     # Client-facing API
     def client_put(self, key: str, value: Any) -> str:
         # Register the write request with Node_ID and ID
@@ -106,6 +112,9 @@ class NodeDynamo:
 
     # Network handler
     def on_message(self, msg: Message) -> None:
+        sender = msg.get("from")
+        if sender is not None:
+            self.mark_seen(sender)
         if msg["type"] == "replicate":
             self.receive(msg["key"], msg["value"])
             self.transport.send(msg["coordinator"], {"type": "ack", "request_id": msg["request_id"], "node_id": self.node_id})
@@ -127,6 +136,10 @@ class NodeDynamo:
                     del self.pending_reads[msg["request_id"]]
         elif msg["type"] == "gossip":
             self.known_members.update(msg["members"])
+        elif msg["type"] == "ping":
+            self.transport.send(sender, {"type": "pong"})
+        elif msg["type"] == "pong":
+            pass  # Just mark_seen is enough
         else:
             raise ValueError(f"Unknown message type in {msg!r}")
         
@@ -175,8 +188,27 @@ class NodeDynamo:
         self.gossip_once()
         self.scheduler.call_later(self.gossip_interval_ms, self.on_gossip_tick)
 
+    def on_health_check_tick(self) -> None:
+        time = self.scheduler.now_ms()
+        for peer in sorted(self.known_members):
+            if peer == self.node_id:
+                continue
+            last_seen = self.last_seen.setdefault(peer, time)
+            if time - last_seen >= self.failure_timeout_ms:
+                self.suspected_nodes.add(peer)
+            self.transport.send(peer, {"type": "ping"})
+        self.scheduler.call_later(
+            self.health_check_interval_ms,
+            self.on_health_check_tick,
+        )
+
+    def mark_seen(self, node_id: str) -> None:
+        self.last_seen[node_id] = self.scheduler.now_ms()
+        self.suspected_nodes.discard(node_id)
+
     def __post_init__(self) -> None:
         self.load_store()
         self.known_members.add(self.node_id)
         self.known_members.update(self.peers)
         self.scheduler.call_later(self.gossip_interval_ms, self.on_gossip_tick)
+        self.scheduler.call_later(self.health_check_interval_ms, self.on_health_check_tick)

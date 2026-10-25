@@ -351,26 +351,34 @@ def test_periodic_gossip_spreads_membership(monkeypatch):
         nodes[node_id] = node
         network.register(node_id, node.on_message)
 
+    def gossip_send_count():
+        return sum(
+            event.kind == "send"
+            and event.msg.get("type") == "gossip"
+            for event in network.trace
+        )
+
     # Before the first tick, nobody has learned anything new.
     scheduler.run_until(999)
 
     assert nodes["A"].known_members == {"A", "B"}
     assert nodes["B"].known_members == {"B", "C"}
     assert nodes["C"].known_members == {"A", "C"}
+    assert gossip_send_count() == 0
 
-    # The first tick sends at 1000 ms; delivery happens at 1010 ms.
+    # First gossip messages arrive at 1010 ms.
     scheduler.run_until(1010)
 
     for node in nodes.values():
         assert node.known_members == {"A", "B", "C"}
 
-    # A second round confirms that gossip reschedules itself.
-    sent_after_first_round = network.stats["sent"]
+    sent_after_first_round = gossip_send_count()
     assert sent_after_first_round == 3
 
+    # Each node sends another gossip message in the second round.
     scheduler.run_until(2010)
 
-    assert network.stats["sent"] == sent_after_first_round + 3
+    assert gossip_send_count() == sent_after_first_round + 3
 
 def test_gossip_with_no_other_members():
     scheduler = SimScheduler()
@@ -439,5 +447,86 @@ def test_gossip_spreads_membership_after_partition_heals(monkeypatch):
 
     for node in nodes.values():
         assert node.known_members == {"A", "B", "C"}
+
+def make_health_check_cluster():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(10, 10))
+    node_ids = ["A", "B", "C"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            health_check_interval_ms=1000,
+            failure_timeout_ms=3000,
+            # Keep gossip out of these tests so pings/pongs
+            # are responsible for refreshing last_seen.
+            gossip_interval_ms=100000,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    return scheduler, network, nodes
+
+
+def test_healthy_nodes_are_not_suspected():
+    scheduler, network, nodes = make_health_check_cluster()
+
+    scheduler.run_until(10000)
+
+    for node_id, node in nodes.items():
+        assert node.suspected_nodes == set()
+
+        for peer in nodes:
+            if peer != node_id:
+                assert node.last_seen[peer] > 0
+
+
+def test_isolated_node_is_suspected_after_timeout():
+    scheduler, network, nodes = make_health_check_cluster()
+    network.add_rule(partition({"B"}))
+
+    # First health check at 1000 ms starts B's grace period.
+    scheduler.run_until(3999)
+
+    assert "B" not in nodes["A"].suspected_nodes
+    assert "B" not in nodes["C"].suspected_nodes
+
+    # At 4000 ms, B has been silent for the full 3000 ms.
+    scheduler.run_until(4000)
+
+    assert nodes["A"].suspected_nodes == {"B"}
+    assert nodes["C"].suspected_nodes == {"B"}
+
+    # From isolated B's perspective, A and C are unreachable.
+    assert nodes["B"].suspected_nodes == {"A", "C"}
+
+    for node_id, node in nodes.items():
+        assert node_id not in node.suspected_nodes
+
+
+def test_suspicion_clears_after_partition_heals():
+    scheduler, network, nodes = make_health_check_cluster()
+    cut = partition({"B"})
+    network.add_rule(cut)
+
+    scheduler.run_until(4000)
+
+    assert "B" in nodes["A"].suspected_nodes
+    assert "B" in nodes["C"].suspected_nodes
+
+    network.remove_rule(cut)
+
+    # Next probes go out at 5000 ms; replies arrive by 5020 ms.
+    scheduler.run_until(5100)
+
+    for node in nodes.values():
+        assert node.suspected_nodes == set()
+
+    assert nodes["A"].last_seen["B"] >= 5000
+    assert nodes["C"].last_seen["B"] >= 5000
 
 
