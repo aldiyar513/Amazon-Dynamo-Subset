@@ -20,3 +20,8 @@ def compare_clocks(left: dict[str, int], right: dict[str, int]) -> str:
         return 'equal'
     else:
         return "concurrent"
+
+def increment_clock(clock: dict[str, int], node_id: str) -> dict[str, int]:
+    new_clock = clock.copy()
+    new_clock[node_id] = new_clock.get(node_id, 0) + 1
+    return new_clock

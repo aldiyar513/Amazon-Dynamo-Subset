@@ -529,4 +529,71 @@ def test_suspicion_clears_after_partition_heals():
     assert nodes["A"].last_seen["B"] >= 5000
     assert nodes["C"].last_seen["B"] >= 5000
 
+def test_write_replicates_same_clock_to_all_nodes():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(30, 80))
 
+    node_ids = ["A", "B", "C"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    request_id = nodes["A"].client_put("cart:42", {"book": 2})
+
+    # The client write increments A's counter immediately.
+    assert nodes["A"].clocks["cart:42"] == {"A": 1}
+
+    scheduler.run_until(200)
+
+    assert request_id in nodes["A"].successful_writes
+
+    for node in nodes.values():
+        assert node.store["cart:42"] == {"book": 2}
+        # Receiving a replica must not increment the receiver's counter.
+        assert node.clocks["cart:42"] == {"A": 1}
+
+
+def test_update_through_another_node_preserves_clock_history():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(30, 80))
+
+    node_ids = ["A", "B", "C"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    nodes["A"].client_put("cart:42", {"book": 2})
+    scheduler.run_until(200)
+
+    # B must receive A's version before updating it.
+    assert nodes["B"].clocks["cart:42"] == {"A": 1}
+    previous_clock = nodes["B"].clocks["cart:42"]
+
+    request_id = nodes["B"].client_put("cart:42", {"book": 3})
+
+    assert nodes["B"].clocks["cart:42"] == {"A": 1, "B": 1}
+    assert previous_clock == {"A": 1}
+
+    scheduler.run_until(400)
+
+    assert request_id in nodes["B"].successful_writes
+
+    for node in nodes.values():
+        assert node.store["cart:42"] == {"book": 3}
+        assert node.clocks["cart:42"] == {"A": 1, "B": 1}

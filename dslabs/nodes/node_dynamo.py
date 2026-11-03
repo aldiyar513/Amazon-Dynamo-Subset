@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any
 import json
 from dslabs.protocols import Message, Scheduler, Transport
-
+from dslabs.vector_clock import increment_clock 
 
 @dataclass
 class NodeDynamo:
@@ -53,13 +53,17 @@ class NodeDynamo:
     failure_timeout_ms: int = 3000
 
     health_check_interval_ms: int = 1000
+    clocks: dict[str, dict[str, int]] = field(default_factory=dict) 
+
 
     # Client-facing API
     def client_put(self, key: str, value: Any) -> str:
-        # Register the write request with Node_ID and ID
         self.request_counter += 1
         request_id = f"{self.node_id}:{self.request_counter}"
-        self.receive_and_replicate(request_id, key, value)
+
+        new_clock = increment_clock(self.clocks.get(key, {}), self.node_id)
+        self.receive_and_replicate(request_id, key, value, new_clock)
+
         return request_id
 
     def client_get(self, key: str) -> str:
@@ -84,9 +88,9 @@ class NodeDynamo:
         return request_id
 
     # Node internals
-    def receive_and_replicate(self, request_id: str, key: str, value: Any) -> None:
-        # Write the Request then count it 
-        self.receive(key, value)
+    def receive_and_replicate(self, request_id: str, key: str, value: Any, clock: dict[str, int]) -> None:
+        # Write the Request then count it
+        self.receive(key, value, clock)
         self.pending_writes[request_id] = {self.node_id}
         self.scheduler.call_later(
                     self.write_timeout_ms,
@@ -98,15 +102,16 @@ class NodeDynamo:
             self.successful_writes.add(request_id)
         for peer in self.peers:
             if peer != self.node_id:
-                self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id})
+                self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id, "clock": clock})
 
-    def receive(self, key: str, value: Any) -> None:
+    def receive(self, key: str, value: Any, clock: dict[str, int]) -> None:
         # Received messages are delivered immediately
-        self.deliver(key, value)
+        self.deliver(key, value, clock)
 
-    def deliver(self, key: str, value: Any) -> None:
+    def deliver(self, key: str, value: Any, clock: dict[str, int]) -> None:
         """Apply a message to this node: update the store, append to the log."""
         self.store[key] = value
+        self.clocks[key] = clock.copy()
         self.log.append((key, value))
         self.save_store()
 
@@ -116,7 +121,7 @@ class NodeDynamo:
         if sender is not None:
             self.mark_seen(sender)
         if msg["type"] == "replicate":
-            self.receive(msg["key"], msg["value"])
+            self.receive(msg["key"], msg["value"], msg["clock"])
             self.transport.send(msg["coordinator"], {"type": "ack", "request_id": msg["request_id"], "node_id": self.node_id})
 
         elif msg["type"] == "ack":
