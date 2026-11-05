@@ -597,3 +597,65 @@ def test_update_through_another_node_preserves_clock_history():
     for node in nodes.values():
         assert node.store["cart:42"] == {"book": 3}
         assert node.clocks["cart:42"] == {"A": 1, "B": 1}
+
+def make_single_node():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0)
+
+    node = NodeDynamo(
+        node_id="A",
+        peers=["A"],
+        transport=network.endpoint("A"),
+        scheduler=scheduler,
+    )
+    network.register("A", node.on_message)
+    return node
+
+
+def test_receive_accepts_new_key():
+    node = make_single_node()
+
+    node.receive("cart:42", {"book": 2}, {"B": 1})
+
+    assert node.store["cart:42"] == {"book": 2}
+    assert node.clocks["cart:42"] == {"B": 1}
+    assert node.log == [("cart:42", {"book": 2})]
+
+
+def test_receive_applies_newer_version():
+    node = make_single_node()
+    node.receive("cart:42", {"book": 2}, {"B": 1})
+
+    node.receive("cart:42", {"book": 3}, {"B": 2})
+
+    assert node.store["cart:42"] == {"book": 3}
+    assert node.clocks["cart:42"] == {"B": 2}
+    assert node.log == [
+        ("cart:42", {"book": 2}),
+        ("cart:42", {"book": 3}),
+    ]
+
+
+def test_receive_ignores_delayed_older_version():
+    node = make_single_node()
+    node.receive("cart:42", {"book": 3}, {"B": 2})
+
+    # An older message arrives after the newer version.
+    node.receive("cart:42", {"book": 2}, {"B": 1})
+
+    assert node.store["cart:42"] == {"book": 3}
+    assert node.clocks["cart:42"] == {"B": 2}
+    assert node.log == [("cart:42", {"book": 3})]
+
+
+def test_receive_ignores_duplicate_version():
+    node = make_single_node()
+    node.receive("cart:42", {"book": 2}, {"B": 1})
+
+    # Deliver the same version again.
+    node.receive("cart:42", {"book": 2}, {"B": 1})
+
+    assert node.store["cart:42"] == {"book": 2}
+    assert node.clocks["cart:42"] == {"B": 1}
+    assert node.log == [("cart:42", {"book": 2})]
+    

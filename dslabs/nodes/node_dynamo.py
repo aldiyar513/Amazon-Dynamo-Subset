@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any
 import json
 from dslabs.protocols import Message, Scheduler, Transport
-from dslabs.vector_clock import increment_clock 
+from dslabs.vector_clock import increment_clock, compare_clocks
 
 @dataclass
 class NodeDynamo:
@@ -105,9 +105,26 @@ class NodeDynamo:
                 self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id, "clock": clock})
 
     def receive(self, key: str, value: Any, clock: dict[str, int]) -> None:
-        # Received messages are delivered immediately
-        self.deliver(key, value, clock)
+        # No existing value 
+        if key not in self.store:
+            self.deliver(key, value, clock)
+            return
 
+        result = compare_clocks(clock, self.clocks.get(key, {}))
+
+        if result == "after":
+            # The incoming version includes newer history.
+            self.deliver(key, value, clock)
+            return 
+
+        elif result in ("before", "equal"):
+            # Ignore older versions and duplicates.
+            return
+
+        elif result == "concurrent":
+            # Next step: store both versions instead of losing either one.
+            raise NotImplementedError("Concurrent version storage is not implemented yet")
+    
     def deliver(self, key: str, value: Any, clock: dict[str, int]) -> None:
         """Apply a message to this node: update the store, append to the log."""
         self.store[key] = value
