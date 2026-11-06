@@ -658,4 +658,53 @@ def test_receive_ignores_duplicate_version():
     assert node.store["cart:42"] == {"book": 2}
     assert node.clocks["cart:42"] == {"B": 1}
     assert node.log == [("cart:42", {"book": 2})]
+
+def test_receive_keeps_concurrent_versions_in_either_order():
+    key = "cart:42"
+    books = ({"book": 3}, {"A": 2})
+    books_and_pen = ({"book": 2, "pen": 1}, {"A": 1, "B": 1})
+
+    for first, second in ((books, books_and_pen), (books_and_pen, books)):
+        node = make_single_node()
+        node.receive(key, *first)
+        node.receive(key, *second)
+
+        siblings = node.versions[key]
+        assert len(siblings) == 2
+        assert books in siblings
+        assert books_and_pen in siblings
+
+
+def test_receive_replaces_only_the_sibling_it_supersedes():
+    node = make_single_node()
+    key = "cart:42"
+    older = ({"book": 3}, {"A": 2})
+    concurrent = ({"book": 2, "pen": 1}, {"A": 1, "B": 1})
+    newer = ({"book": 4}, {"A": 3})
+
+    node.receive(key, *older)
+    node.receive(key, *concurrent)
+    node.receive(key, *newer)
+
+    siblings = node.versions[key]
+    assert len(siblings) == 2
+    assert newer in siblings
+    assert concurrent in siblings
+    assert older not in siblings
+
+
+def test_receive_does_not_add_duplicate_when_siblings_exist():
+    node = make_single_node()
+    key = "cart:42"
+    books_and_pen = ({"book": 2, "pen": 1}, {"A": 1, "B": 1})
+    books = ({"book": 4}, {"A": 3})
+
+    node.receive(key, *books_and_pen)
+    node.receive(key, *books)
+
+    before = node.versions[key].copy()
+    node.receive(key, *books)
+
+    assert len(node.versions[key]) == 2
+    assert node.versions[key] == before
     

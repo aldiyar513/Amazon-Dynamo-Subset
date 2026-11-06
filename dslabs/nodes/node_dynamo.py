@@ -55,6 +55,7 @@ class NodeDynamo:
     health_check_interval_ms: int = 1000
     clocks: dict[str, dict[str, int]] = field(default_factory=dict) 
 
+    versions: dict[str, list[tuple[Any, dict[str, int]]]] = field(default_factory=dict) 
 
     # Client-facing API
     def client_put(self, key: str, value: Any) -> str:
@@ -105,26 +106,23 @@ class NodeDynamo:
                 self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id, "clock": clock})
 
     def receive(self, key: str, value: Any, clock: dict[str, int]) -> None:
-        # No existing value 
-        if key not in self.store:
-            self.deliver(key, value, clock)
-            return
+        siblings = self.versions.get(key, [])
+        survivors: list[tuple[Any, dict[str, int]]] = []
 
-        result = compare_clocks(clock, self.clocks.get(key, {}))
+        for sibling_value, sibling_clock in siblings:
+            result = compare_clocks(clock, sibling_clock)
 
-        if result == "after":
-            # The incoming version includes newer history.
-            self.deliver(key, value, clock)
-            return 
+            if result in ("before", "equal"):
+                return
 
-        elif result in ("before", "equal"):
-            # Ignore older versions and duplicates.
-            return
+            if result == "concurrent":
+                survivors.append((sibling_value, sibling_clock))
 
-        elif result == "concurrent":
-            # Next step: store both versions instead of losing either one.
-            raise NotImplementedError("Concurrent version storage is not implemented yet")
-    
+            
+        survivors.append((value, clock.copy()))
+        self.versions[key] = survivors
+        self.deliver(key, value, clock)
+        
     def deliver(self, key: str, value: Any, clock: dict[str, int]) -> None:
         """Apply a message to this node: update the store, append to the log."""
         self.store[key] = value
