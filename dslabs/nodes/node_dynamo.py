@@ -40,8 +40,8 @@ class NodeDynamo:
     # Reading Writes 
     read_quorum: int = 2
     pending_reads: dict[str, dict[str, Any]] = field(default_factory=dict)
-    completed_reads: dict[str, dict[str, Any]] = field(default_factory=dict)
-    
+    completed_reads: dict[str, list[tuple[Any, dict[str, int]]]] = field(default_factory=dict)
+
     storage_path: str | None = None
 
     known_members: set[str] = field(default_factory=set)
@@ -71,15 +71,15 @@ class NodeDynamo:
         self.request_counter += 1
         request_id = f"{self.node_id}:{self.request_counter}"
         self.pending_reads[request_id] = {
-                    self.node_id: self.store.get(key)
-                }
+                self.node_id: self.versions.get(key, []).copy()
+            }
         self.scheduler.call_later(
             self.read_timeout_ms,
             lambda: self.on_read_timeout(request_id),
         )
         # if we need only one node to confirm 
         if len(self.pending_reads[request_id]) >= self.read_quorum:
-            self.completed_reads[request_id] = self.pending_reads[request_id]
+            self.completed_reads[request_id] = self._merge_read_versions(self.pending_reads[request_id])
             del self.pending_reads[request_id]
 
         # Send read requests to peers
@@ -130,6 +130,28 @@ class NodeDynamo:
         self.log.append((key, value))
         self.save_store()
 
+    def _merge_read_versions(self, responses: dict[str, list[tuple[Any, dict[str, int]]]]) -> list[tuple[Any, dict[str, int]]]:
+        survivors: list[tuple[Any, dict[str, int]]] = []
+        for versions in responses.values():
+            for value, clock in versions:
+                remaining: list[tuple[Any, dict[str, int]]] = []
+
+                for stored_value, stored_clock in survivors:
+                    result = compare_clocks(clock, stored_clock)
+
+                    if result in ("before", "equal"):
+                        break  # Skip this incoming version.
+
+                    if result == "concurrent":
+                        remaining.append((stored_value, stored_clock))
+
+                    # If result is "after", leave the older version out.
+                else:
+                    remaining.append((value, clock.copy()))
+                    survivors = remaining
+
+        return survivors
+
     # Network handler
     def on_message(self, msg: Message) -> None:
         sender = msg.get("from")
@@ -147,13 +169,17 @@ class NodeDynamo:
                     self.successful_writes.add(msg["request_id"])
         elif msg["type"] == "read":
             # Just look up the value and send to the coordinator
-            self.transport.send(msg["coordinator"], {"type": "read_response", "request_id": msg["request_id"], "node_id": self.node_id, "value": self.store.get(msg["key"])})
+            self.transport.send(msg["coordinator"], {"type": "read_response", "request_id": msg["request_id"], "node_id": self.node_id, "value": self.versions.get(msg["key"], []).copy()})
         elif msg["type"] == "read_response":
-            if msg["request_id"] in self.pending_reads:
-                self.pending_reads[msg["request_id"]][msg["node_id"]] = msg["value"]
-                if len(self.pending_reads[msg["request_id"]]) >= self.read_quorum:
-                    self.completed_reads[msg["request_id"]] = self.pending_reads[msg["request_id"]]
-                    del self.pending_reads[msg["request_id"]]
+            request_id = msg["request_id"]
+
+            if request_id in self.pending_reads:
+                responses = self.pending_reads[request_id]
+                responses[msg["node_id"]] = msg["value"]
+
+                if len(responses) >= self.read_quorum:
+                    self.completed_reads[request_id] = self._merge_read_versions(responses)
+                    del self.pending_reads[request_id]
         elif msg["type"] == "gossip":
             self.known_members.update(msg["members"])
         elif msg["type"] == "ping":

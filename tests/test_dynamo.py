@@ -165,17 +165,13 @@ def test_read_reaches_quorum():
     request_id = nodes["A"].client_get("cart:42")
 
     # Only A's local response exists initially
-    assert nodes["A"].pending_reads[request_id] == {
-        "A": {"book": 2}
-    }
+    version = ({"book": 2}, {"A": 1})
+    assert nodes["A"].pending_reads[request_id] == {"A": [version]}
     assert request_id not in nodes["A"].completed_reads
 
     scheduler.run_until(2000)
 
-    responses = nodes["A"].completed_reads[request_id]
-    assert len(responses) == 2
-    assert "A" in responses
-    assert all(value == {"book": 2} for value in responses.values())
+    assert nodes["A"].completed_reads[request_id] == [version]
     assert request_id not in nodes["A"].pending_reads
     assert request_id not in nodes["A"].timed_out_reads
 
@@ -190,9 +186,7 @@ def test_read_quorum_one_succeeds_immediately():
     request_id = nodes["A"].client_get("cart:42")
 
     # Completes without running the scheduler again
-    assert nodes["A"].completed_reads[request_id] == {
-        "A": {"book": 2}
-    }
+    assert nodes["A"].completed_reads[request_id] == [({"book": 2}, {"A": 1})]
     assert request_id not in nodes["A"].pending_reads
 
     scheduler.run_until(2000)
@@ -210,9 +204,7 @@ def test_read_times_out_when_quorum_unreachable():
 
     # Read started at 1000 ms, so its deadline is 1500 ms
     scheduler.run_until(1499)
-    assert nodes["A"].pending_reads[request_id] == {
-        "A": {"book": 2}
-    }
+    assert nodes["A"].pending_reads[request_id] == {"A": [({"book": 2}, {"A": 1})]}
     assert request_id not in nodes["A"].timed_out_reads
     assert request_id not in nodes["A"].completed_reads
 
@@ -708,3 +700,105 @@ def test_receive_does_not_add_duplicate_when_siblings_exist():
     assert len(node.versions[key]) == 2
     assert node.versions[key] == before
     
+def make_read_pair(read_quorum=2):
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(30, 80))
+    nodes = {}
+
+    for node_id in ("A", "B"):
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=["A", "B"],
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            read_quorum=read_quorum,
+        )
+        network.register(node_id, node.on_message)
+        nodes[node_id] = node
+
+    return scheduler, nodes["A"], nodes["B"]
+
+
+def test_read_keeps_concurrent_versions_from_different_replicas():
+    scheduler, a, b = make_read_pair()
+    key = "cart:42"
+    books = ({"book": 3}, {"A": 2})
+    books_and_pen = ({"book": 2, "pen": 1}, {"A": 1, "B": 1})
+
+    a.receive(key, *books)
+    b.receive(key, *books_and_pen)
+
+    request_id = a.client_get(key)
+    assert request_id in a.pending_reads
+    assert request_id not in a.completed_reads
+
+    scheduler.run_until(200)
+
+    result = a.completed_reads[request_id]
+    assert len(result) == 2
+    assert books in result
+    assert books_and_pen in result
+    assert request_id not in a.pending_reads
+
+    # Combining read results doesn't change either replica's storage.
+    assert a.versions[key] == [books]
+    assert b.versions[key] == [books_and_pen]
+
+
+def test_read_deduplicates_versions_reported_by_both_replicas():
+    scheduler, a, b = make_read_pair()
+    key = "cart:42"
+    version = ({"book": 3}, {"A": 2})
+
+    a.receive(key, *version)
+    b.receive(key, *version)
+
+    request_id = a.client_get(key)
+    scheduler.run_until(200)
+
+    assert a.completed_reads[request_id] == [version]
+
+
+def test_read_keeps_newer_version_when_replicas_disagree():
+    scheduler, a, b = make_read_pair()
+    key = "cart:42"
+    older = ({"book": 2}, {"A": 1})
+    newer = ({"book": 3}, {"A": 2})
+
+    a.receive(key, *older)
+    b.receive(key, *newer)
+
+    request_id = a.client_get(key)
+    scheduler.run_until(200)
+
+    assert a.completed_reads[request_id] == [newer]
+    assert a.versions[key] == [older]
+
+
+def test_two_local_versions_still_count_as_one_response():
+    scheduler, a, _ = make_read_pair()
+    key = "cart:42"
+    a.receive(key, {"book": 3}, {"A": 2})
+    a.receive(key, {"pen": 1}, {"B": 1})
+
+    request_id = a.client_get(key)
+
+    assert len(a.pending_reads[request_id]) == 1
+    assert request_id not in a.completed_reads
+
+    # B has no version, but its empty reply still counts toward quorum.
+    scheduler.run_until(200)
+
+    assert a.completed_reads[request_id] == a.versions[key]
+
+
+def test_read_quorum_one_returns_local_versions_immediately():
+    _, a, _ = make_read_pair(read_quorum=1)
+    key = "cart:42"
+    a.receive(key, {"book": 3}, {"A": 2})
+    a.receive(key, {"pen": 1}, {"B": 1})
+
+    request_id = a.client_get(key)
+
+    assert a.completed_reads[request_id] == a.versions[key]
+    assert request_id not in a.pending_reads
