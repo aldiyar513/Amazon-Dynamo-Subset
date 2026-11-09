@@ -25,3 +25,11 @@ def increment_clock(clock: dict[str, int], node_id: str) -> dict[str, int]:
     new_clock = clock.copy()
     new_clock[node_id] = new_clock.get(node_id, 0) + 1
     return new_clock
+
+def merge_clocks(clocks: list[dict[str, int]]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    # Loop over each clock, then over its node IDs and counters.
+    for clock in clocks:
+        for node_id, counter in clock.items():
+            merged[node_id] = max(merged.get(node_id, 0), counter)
+    return merged

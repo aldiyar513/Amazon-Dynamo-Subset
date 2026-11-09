@@ -1,4 +1,4 @@
-from dslabs.vector_clock import compare_clocks, increment_clock
+from dslabs.vector_clock import compare_clocks, increment_clock, merge_clocks
 
 def test_left_clock_is_before_right():
     assert compare_clocks({"A": 1}, {"A": 1, "B": 1}) == "before"
@@ -41,3 +41,11 @@ def test_increment_clock_preserves_original():
 
     assert updated == {"A": 3, "B": 1}
     assert original == {"A": 2, "B": 1}
+
+def test_merge_clocks_keeps_highest_counter_for_each_node():
+    left = {"A": 2, "C": 1}
+    right = {"A": 1, "B": 1}
+
+    assert merge_clocks([left, right]) == {"A": 2, "B": 1, "C": 1}
+    assert left == {"A": 2, "C": 1}
+    assert right == {"A": 1, "B": 1}
