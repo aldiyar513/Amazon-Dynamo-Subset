@@ -2,7 +2,8 @@ from dataclasses import dataclass, field
 from typing import Any
 import json
 from dslabs.protocols import Message, Scheduler, Transport
-from dslabs.vector_clock import increment_clock, compare_clocks
+from dslabs.vector_clock import increment_clock, compare_clocks, merge_clocks
+
 
 @dataclass
 class NodeDynamo:
@@ -58,13 +59,23 @@ class NodeDynamo:
     versions: dict[str, list[tuple[Any, dict[str, int]]]] = field(default_factory=dict) 
 
     # Client-facing API
-    def client_put(self, key: str, value: Any) -> str:
+    def client_put(self, key: str, value: Any, context: list[dict[str, int]] | None = None) -> str:
         self.request_counter += 1
         request_id = f"{self.node_id}:{self.request_counter}"
 
-        new_clock = increment_clock(self.clocks.get(key, {}), self.node_id)
-        self.receive_and_replicate(request_id, key, value, new_clock)
+        if context is None:
+            base_clock = self.clocks.get(key, {}).copy()
+        else:
+            base_clock = merge_clocks(context)
 
+        for _, sibling_clock in self.versions.get(key, []):
+            base_clock[self.node_id] = max(
+                base_clock.get(self.node_id, 0),
+                sibling_clock.get(self.node_id, 0),
+            )
+
+        new_clock = increment_clock(base_clock, self.node_id)
+        self.receive_and_replicate(request_id, key, value, new_clock)
         return request_id
 
     def client_get(self, key: str) -> str:

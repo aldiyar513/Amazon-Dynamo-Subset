@@ -1,7 +1,7 @@
 from dslabs import SimNetwork, SimScheduler
 from dslabs.network import partition
 from dslabs.nodes.node_dynamo import NodeDynamo
-
+  
 
 def test_write_reaches_quorum():
     scheduler = SimScheduler()
@@ -802,3 +802,69 @@ def test_read_quorum_one_returns_local_versions_immediately():
 
     assert a.completed_reads[request_id] == a.versions[key]
     assert request_id not in a.pending_reads
+
+def test_resolution_write_replaces_both_observed_siblings():
+    node = make_single_node()
+    key = "cart:42"
+
+    node.receive(key, {"book": 3}, {"A": 2})
+    node.receive(key, {"book": 2, "pen": 1}, {"A": 1, "B": 1})
+
+    node.client_put(
+        key,
+        {"book": 3, "pen": 1},
+        context=[{"A": 2}, {"A": 1, "B": 1}],
+    )
+
+    assert node.versions[key] == [
+        ({"book": 3, "pen": 1}, {"A": 3, "B": 1})
+    ]
+
+
+def test_resolution_write_preserves_unseen_concurrent_edit():
+    node = make_single_node()
+    key = "cart:42"
+    unseen = ({"notebook": 1}, {"C": 1})
+
+    node.receive(key, {"book": 3}, {"A": 2})
+    node.receive(key, {"book": 2, "pen": 1}, {"A": 1, "B": 1})
+    node.receive(key, *unseen)
+
+    # The client observed A's and B's versions, but not C's.
+    node.client_put(
+        key,
+        {"book": 3, "pen": 1},
+        context=[{"A": 2}, {"A": 1, "B": 1}],
+    )
+
+    siblings = node.versions[key]
+    assert len(siblings) == 2
+    assert unseen in siblings
+    assert ({"book": 3, "pen": 1}, {"A": 3, "B": 1}) in siblings
+
+
+def test_write_with_old_context_advances_own_counter():
+    node = make_single_node()
+    key = "cart:42"
+    node.receive(key, {"book": 5}, {"A": 5})
+
+    node.client_put(key, {"book": 6}, context=[{"A": 2}])
+
+    assert node.versions[key] == [
+        ({"book": 6}, {"A": 6})
+    ]
+
+
+def test_empty_context_does_not_include_unseen_peer_history():
+    node = make_single_node()
+    key = "cart:42"
+    existing = ({"book": 2}, {"A": 2, "B": 1})
+    node.receive(key, *existing)
+
+    node.client_put(key, {"pen": 1}, context=[])
+
+    # A advances its own counter but doesn't copy B's unseen history.
+    siblings = node.versions[key]
+    assert len(siblings) == 2
+    assert existing in siblings
+    assert ({"pen": 1}, {"A": 3}) in siblings
