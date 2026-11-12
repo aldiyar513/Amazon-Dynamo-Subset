@@ -904,3 +904,30 @@ def test_restart_restores_concurrent_versions_and_clocks(tmp_path):
     assert books_and_pen in result
     assert restarted.store[key] == books_and_pen[0]
     assert restarted.clocks[key] == books_and_pen[1]
+
+def test_sync_catches_up_replica_after_partition():
+    scheduler, network, nodes = make_read_cluster()
+    a, c = nodes["A"], nodes["C"]
+    key = "cart:42"
+
+    a.client_put(key, {"book": 2})
+    scheduler.run_until(200)
+    assert c.versions[key] == [({"book": 2}, {"A": 1})]
+
+    cut = partition({"C"})
+    network.add_rule(cut)
+    request_id = a.client_put(key, {"book": 3})
+    scheduler.run_until(400)
+
+    # A and B reached write quorum, but C missed the update.
+    assert request_id in a.successful_writes
+    assert c.versions[key] == [({"book": 2}, {"A": 1})]
+
+    network.remove_rule(cut)
+    scheduler.run_until(600)
+    assert c.versions[key] == [({"book": 2}, {"A": 1})]
+
+    a.sync_with("C")
+    scheduler.run_until(800)
+
+    assert c.versions[key] == [({"book": 3}, {"A": 2})]

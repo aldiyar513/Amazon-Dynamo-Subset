@@ -115,6 +115,12 @@ class NodeDynamo:
         for peer in self.peers:
             if peer != self.node_id:
                 self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id, "clock": clock})
+    
+    def sync_with(self, peer: str) -> None:
+        self.transport.send(peer, {
+            "type": "sync",
+            "versions": self.versions,
+        })
 
     def receive(self, key: str, value: Any, clock: dict[str, int]) -> None:
         siblings = self.versions.get(key, [])
@@ -193,10 +199,14 @@ class NodeDynamo:
                     del self.pending_reads[request_id]
         elif msg["type"] == "gossip":
             self.known_members.update(msg["members"])
+        elif msg["type"] == "sync":
+            for key, siblings in msg["versions"].items():
+                for value, clock in siblings:
+                    self.receive(key, value, clock)
         elif msg["type"] == "ping":
             self.transport.send(sender, {"type": "pong"})
         elif msg["type"] == "pong":
-            pass  # Just mark_seen is enough
+            pass   
         else:
             raise ValueError(f"Unknown message type in {msg!r}")
         
