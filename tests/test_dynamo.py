@@ -868,3 +868,39 @@ def test_empty_context_does_not_include_unseen_peer_history():
     assert len(siblings) == 2
     assert existing in siblings
     assert ({"pen": 1}, {"A": 3}) in siblings
+
+def test_restart_restores_concurrent_versions_and_clocks(tmp_path):
+    key = "cart:42"
+    storage_path = str(tmp_path / "A.json")
+
+    def start_node():
+        scheduler = SimScheduler()
+        network = SimNetwork(scheduler, seed=0)
+        node = NodeDynamo(
+            node_id="A",
+            peers=["A"],
+            transport=network.endpoint("A"),
+            scheduler=scheduler,
+            storage_path=storage_path,
+            read_quorum=1,
+        )
+        network.register("A", node.on_message)
+        return node
+
+    books = ({"book": 3}, {"A": 2})
+    books_and_pen = ({"book": 2, "pen": 1}, {"A": 1, "B": 1})
+
+    node = start_node()
+    node.receive(key, *books)
+    node.receive(key, *books_and_pen)
+
+    # A fresh node loads the same file with no help from other replicas.
+    restarted = start_node()
+    request_id = restarted.client_get(key)
+    result = restarted.completed_reads[request_id]
+
+    assert len(result) == 2
+    assert books in result
+    assert books_and_pen in result
+    assert restarted.store[key] == books_and_pen[0]
+    assert restarted.clocks[key] == books_and_pen[1]

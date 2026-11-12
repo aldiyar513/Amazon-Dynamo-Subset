@@ -218,7 +218,7 @@ class NodeDynamo:
         # Write to the store path to the file as well 
         if self.storage_path:
             with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump(self.store, f)
+                json.dump({ "store": self.store, "versions": self.versions,}, f)
         else: 
             return 
     def load_store(self) -> None:
@@ -226,7 +226,17 @@ class NodeDynamo:
         if self.storage_path:
             try:
                 with open(self.storage_path, "r", encoding="utf-8") as f:
-                    self.store = json.load(f)
+                    data = json.load(f)
+                    self.store = data["store"]
+                    self.versions = {
+                        key: [(value, clock) for value, clock in siblings]
+                        for key, siblings in data["versions"].items()
+                    }
+                    self.clocks = {
+                        key: siblings[-1][1].copy()
+                        for key, siblings in self.versions.items()
+                        if siblings
+                    }
             except FileNotFoundError:
                 pass
         else: 
