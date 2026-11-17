@@ -18,3 +18,27 @@ def find_owner(key: str, ring: list[tuple[int, str]]) -> str:
             return node_id
 
     return ring[0][1]  # Wrap around to the first node.
+
+def select_replicas(key: str, ring: list[tuple[int, str]], replication_factor: int) -> list[str]:
+    if not ring:
+        raise ValueError("Cannot select replicas from an empty ring")
+
+    if replication_factor < 1:
+        raise ValueError("Replication factor must be at least 1")
+
+    if replication_factor > len(ring):
+        raise ValueError("Replication factor cannot exceed the number of nodes")
+
+    key_hash = hash_position(key)
+    start_index = 0
+
+    for i, (node_hash, node_id) in enumerate(ring):
+        if key_hash <= node_hash:
+            start_index = i
+            break
+
+    replicas = []
+    for j in range(replication_factor):
+        replicas.append(ring[(start_index + j) % len(ring)][1])
+
+    return replicas
