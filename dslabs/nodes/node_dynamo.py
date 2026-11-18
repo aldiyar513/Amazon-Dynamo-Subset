@@ -3,7 +3,7 @@ from typing import Any
 import json
 from dslabs.protocols import Message, Scheduler, Transport
 from dslabs.vector_clock import increment_clock, compare_clocks, merge_clocks
-
+from dslabs.hash_ring import build_ring,  select_replicas 
 
 @dataclass
 class NodeDynamo:
@@ -57,6 +57,7 @@ class NodeDynamo:
     clocks: dict[str, dict[str, int]] = field(default_factory=dict) 
 
     versions: dict[str, list[tuple[Any, dict[str, int]]]] = field(default_factory=dict) 
+    replication_factor: int = 3
 
     # Client-facing API
     def client_put(self, key: str, value: Any, context: list[dict[str, int]] | None = None) -> str:
@@ -102,8 +103,12 @@ class NodeDynamo:
     # Node internals
     def receive_and_replicate(self, request_id: str, key: str, value: Any, clock: dict[str, int]) -> None:
         # Write the Request then count it
-        self.receive(key, value, clock)
-        self.pending_writes[request_id] = {self.node_id}
+        replicas = select_replicas(key, self.ring, self.replication_factor)
+        self.pending_writes[request_id] = set()
+
+        if self.node_id in replicas:
+            self.receive(key, value, clock)
+            self.pending_writes[request_id].add(self.node_id)
         self.scheduler.call_later(
                     self.write_timeout_ms,
                     lambda: self.on_write_timeout(request_id),
@@ -112,7 +117,7 @@ class NodeDynamo:
         if len(self.pending_writes[request_id]) >= self.write_quorum:
             del self.pending_writes[request_id]
             self.successful_writes.add(request_id)
-        for peer in self.peers:
+        for peer in replicas:
             if peer != self.node_id:
                 self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id, "clock": clock})
     
@@ -289,3 +294,7 @@ class NodeDynamo:
         self.known_members.update(self.peers)
         self.scheduler.call_later(self.gossip_interval_ms, self.on_gossip_tick)
         self.scheduler.call_later(self.health_check_interval_ms, self.on_health_check_tick)
+        
+        node_ids = set(self.peers)
+        node_ids.add(self.node_id)
+        self.ring = build_ring(list(node_ids))
