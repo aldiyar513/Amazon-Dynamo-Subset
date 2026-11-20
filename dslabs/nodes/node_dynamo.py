@@ -58,6 +58,7 @@ class NodeDynamo:
 
     versions: dict[str, list[tuple[Any, dict[str, int]]]] = field(default_factory=dict) 
     replication_factor: int = 3
+    issued_write_counters: dict[str, int] = field(default_factory=dict)
 
     # Client-facing API
     def client_put(self, key: str, value: Any, context: list[dict[str, int]] | None = None) -> str:
@@ -75,6 +76,13 @@ class NodeDynamo:
                 sibling_clock.get(self.node_id, 0),
             )
 
+        base_clock = base_clock.copy()
+        base_clock[self.node_id] = max(
+            base_clock.get(self.node_id, 0),
+            self.issued_write_counters.get(key, 0),
+        )
+        new_clock = increment_clock(base_clock, self.node_id)
+        self.issued_write_counters[key] = new_clock[self.node_id]
         new_clock = increment_clock(base_clock, self.node_id)
         self.receive_and_replicate(request_id, key, value, new_clock)
         return request_id
@@ -82,6 +90,13 @@ class NodeDynamo:
     def client_get(self, key: str) -> str:
         self.request_counter += 1
         request_id = f"{self.node_id}:{self.request_counter}"
+        replicas = select_replicas(key, self.ring, self.replication_factor)
+        self.pending_reads[request_id] = {}
+
+        if self.node_id in replicas:
+            self.pending_reads[request_id][self.node_id] = (
+                self.versions.get(key, []).copy()
+            )
         self.pending_reads[request_id] = {
                 self.node_id: self.versions.get(key, []).copy()
             }
@@ -95,7 +110,7 @@ class NodeDynamo:
             del self.pending_reads[request_id]
 
         # Send read requests to peers
-        for peer in self.peers:
+        for peer in replicas:
             if peer != self.node_id:
                 self.transport.send(peer, {"type": "read", "key": key, "request_id": request_id, "coordinator": self.node_id})
         return request_id

@@ -931,3 +931,39 @@ def test_sync_catches_up_replica_after_partition():
     scheduler.run_until(800)
 
     assert c.versions[key] == [({"book": 3}, {"A": 2})]
+
+
+from dslabs.hash_ring import select_replicas
+
+
+def test_coordinator_outside_replica_set_can_update_same_key():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(10, 10))
+    node_ids = ["A", "B", "C", "D", "E"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            replication_factor=3,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    key = "cart:42"
+    replicas = select_replicas(key, nodes["A"].ring, 3)
+    coordinator = next(nodes[n] for n in node_ids if n not in replicas)
+
+    first = coordinator.client_put(key, {"book": 2})
+    scheduler.run_until(100)
+    assert first in coordinator.successful_writes
+    assert all(nodes[n].store.get(key) == {"book": 2} for n in replicas)
+
+    second = coordinator.client_put(key, {"book": 3})
+    scheduler.run_until(200)
+    assert second in coordinator.successful_writes
+    assert all(nodes[n].store.get(key) == {"book": 3} for n in replicas)
+    assert all(key not in nodes[n].store for n in node_ids if n not in replicas)
