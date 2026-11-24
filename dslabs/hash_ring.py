@@ -40,5 +40,12 @@ def select_replicas(key: str, ring: list[tuple[int, str]], replication_factor: i
     replicas = []
     for j in range(replication_factor):
         replicas.append(ring[(start_index + j) % len(ring)][1])
-
     return replicas
+
+def select_fallback(key: str, ring: list[tuple[int, str]], home_replicas: list[str], suspected_nodes: set[str],) -> str | None:
+    for node in select_replicas(key, ring, len(ring)):
+        if node not in home_replicas and node not in suspected_nodes:
+            return node
+    return None
+
+    
