@@ -3,7 +3,7 @@ from typing import Any
 import json
 from dslabs.protocols import Message, Scheduler, Transport
 from dslabs.vector_clock import increment_clock, compare_clocks, merge_clocks
-from dslabs.hash_ring import build_ring,  select_replicas 
+from dslabs.hash_ring import build_ring,  select_replicas, select_fallback
 
 @dataclass
 class NodeDynamo:
@@ -28,6 +28,7 @@ class NodeDynamo:
 
     # Request ID -> set of nodes that have acknowledged the write
     pending_writes: dict[str, set[str]] = field(default_factory=dict)
+    hints: dict[str, dict[str, Any]] = field(default_factory=dict) 
 
     successful_writes: set[str] = field(default_factory=set)
     # write time outs 
@@ -117,6 +118,7 @@ class NodeDynamo:
 
     # Node internals
     def receive_and_replicate(self, request_id: str, key: str, value: Any, clock: dict[str, int]) -> None:
+        used_fallbacks = set()
         # Write the Request then count it
         replicas = select_replicas(key, self.ring, self.replication_factor)
         self.pending_writes[request_id] = set()
@@ -132,10 +134,32 @@ class NodeDynamo:
         if len(self.pending_writes[request_id]) >= self.write_quorum:
             del self.pending_writes[request_id]
             self.successful_writes.add(request_id)
-        for peer in replicas:
-            if peer != self.node_id:
-                self.transport.send(peer, {"type": "replicate", "key": key, "value": value, "request_id": request_id, "coordinator": self.node_id, "clock": clock})
-    
+        for home in replicas:
+            if home == self.node_id:
+                continue
+
+            recipient = home
+            msg = {
+                "type": "replicate",
+                "key": key,
+                "value": value,
+                "request_id": request_id,
+                "coordinator": self.node_id,
+                "clock": clock,
+            }
+
+            if home in self.suspected_nodes:
+                fallback = select_fallback(
+                    key, self.ring, replicas, self.suspected_nodes | used_fallbacks
+                )
+                if fallback is None:
+                    continue
+
+                recipient = fallback
+                msg["hint_for"] = home
+                used_fallbacks.add(fallback)
+
+            self.transport.send(recipient, msg)
     def sync_with(self, peer: str) -> None:
         self.transport.send(peer, {
             "type": "sync",
@@ -195,7 +219,15 @@ class NodeDynamo:
         if sender is not None:
             self.mark_seen(sender)
         if msg["type"] == "replicate":
-            self.receive(msg["key"], msg["value"], msg["clock"])
+            if "hint_for" in msg:
+                self.hints[msg["request_id"]] = {
+                    "home": msg["hint_for"],
+                    "key": msg["key"],
+                    "value": msg["value"],
+                    "clock": msg["clock"].copy(),
+                }
+            else:
+                self.receive(msg["key"], msg["value"], msg["clock"])
             self.transport.send(msg["coordinator"], {"type": "ack", "request_id": msg["request_id"], "node_id": self.node_id})
 
         elif msg["type"] == "ack":

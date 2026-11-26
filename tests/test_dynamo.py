@@ -1,7 +1,9 @@
-from dslabs import SimNetwork, SimScheduler
+from dslabs import SimNetwork, SimScheduler, partition
 from dslabs.network import partition
 from dslabs.nodes.node_dynamo import NodeDynamo
-  
+from dslabs.hash_ring import select_fallback, select_replicas
+
+
 
 def test_write_reaches_quorum():
     scheduler = SimScheduler()
@@ -967,3 +969,65 @@ def test_coordinator_outside_replica_set_can_update_same_key():
     assert second in coordinator.successful_writes
     assert all(nodes[n].store.get(key) == {"book": 3} for n in replicas)
     assert all(key not in nodes[n].store for n in node_ids if n not in replicas)
+
+def test_fallback_holds_hint_and_counts_toward_write_quorum():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(10, 10))
+    node_ids = ["A", "B", "C", "D", "E"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            replication_factor=3,
+            write_quorum=3,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    key = "cart:42"
+    value = {"book": 3}
+    ring = nodes["A"].ring
+    homes = select_replicas(key, ring, 3)
+
+    # One home coordinates, one stays reachable, and one goes offline.
+    coordinator_id, healthy_id, offline_id = homes
+    coordinator = nodes[coordinator_id]
+    network.add_rule(partition({offline_id}))
+    coordinator.suspected_nodes.add(offline_id)
+
+    fallback_id = select_fallback(key, ring, homes, {offline_id})
+    assert fallback_id is not None
+
+    request_id = coordinator.client_put(key, value)
+    assert coordinator.pending_writes[request_id] == {coordinator_id}
+
+    # At 10 ms the write has arrived, but the remote ACKs are still in flight.
+    scheduler.run_until(10)
+    assert nodes[healthy_id].store[key] == value
+    assert key not in nodes[offline_id].store
+    assert nodes[fallback_id].hints[request_id] == {
+        "home": offline_id,
+        "key": key,
+        "value": value,
+        "clock": {coordinator_id: 1},
+    }
+    assert request_id not in coordinator.successful_writes
+
+    # At 20 ms the healthy home and the fallback have both replied.
+    scheduler.run_until(20)
+    assert request_id in coordinator.successful_writes
+    assert request_id not in coordinator.pending_writes
+
+    ack_senders = {
+        event.msg["from"]
+        for event in network.trace
+        if event.kind == "deliver"
+        and event.to == coordinator_id
+        and event.msg["type"] == "ack"
+        and event.msg["request_id"] == request_id
+    }
+    assert ack_senders == {healthy_id, fallback_id}
