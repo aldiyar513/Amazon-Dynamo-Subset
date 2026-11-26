@@ -1031,3 +1031,65 @@ def test_fallback_holds_hint_and_counts_toward_write_quorum():
         and event.msg["request_id"] == request_id
     }
     assert ack_senders == {healthy_id, fallback_id}
+
+
+def test_hinted_handoff_delivers_update_and_clears_hint_after_ack():
+    scheduler = SimScheduler()
+    network = SimNetwork(scheduler, seed=0, latency_ms=(10, 10))
+    node_ids = ["A", "B", "C", "D", "E"]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = NodeDynamo(
+            node_id=node_id,
+            peers=node_ids,
+            transport=network.endpoint(node_id),
+            scheduler=scheduler,
+            replication_factor=3,
+            write_quorum=3,
+        )
+        nodes[node_id] = node
+        network.register(node_id, node.on_message)
+
+    key = "cart:42"
+    value = {"book": 3}
+    ring = nodes["A"].ring
+    homes = select_replicas(key, ring, 3)
+    coordinator_id, _, offline_id = homes
+    coordinator = nodes[coordinator_id]
+    home = nodes[offline_id]
+
+    fallback_id = select_fallback(key, ring, homes, {offline_id})
+    assert fallback_id is not None
+    fallback = nodes[fallback_id]
+
+    cut = partition({offline_id})
+    network.add_rule(cut)
+    coordinator.suspected_nodes.add(offline_id)
+
+    request_id = coordinator.client_put(key, value)
+    scheduler.run_until(20)
+
+    assert request_id in coordinator.successful_writes
+    assert key not in home.store
+    clock = fallback.hints[request_id]["clock"].copy()
+
+    # A handoff attempt while the partition is active can't clear the hint.
+    fallback.send_pending_hints()
+    scheduler.run_until(40)
+    assert key not in home.store
+    assert request_id in fallback.hints
+
+    # Heal the partition and trigger the next attempt.
+    network.remove_rule(cut)
+    fallback.send_pending_hints()
+
+    # The update arrives after 10 ms. The ACK is still in flight.
+    scheduler.run_until(50)
+    assert home.store[key] == value
+    assert home.versions[key] == [(value, clock)]
+    assert request_id in fallback.hints
+
+    # The ACK arrives after another 10 ms.
+    scheduler.run_until(60)
+    assert request_id not in fallback.hints

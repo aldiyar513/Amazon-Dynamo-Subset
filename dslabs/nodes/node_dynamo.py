@@ -191,6 +191,7 @@ class NodeDynamo:
         self.log.append((key, value))
         self.save_store()
 
+
     def _merge_read_versions(self, responses: dict[str, list[tuple[Any, dict[str, int]]]]) -> list[tuple[Any, dict[str, int]]]:
         survivors: list[tuple[Any, dict[str, int]]] = []
         for versions in responses.values():
@@ -259,6 +260,19 @@ class NodeDynamo:
             self.transport.send(sender, {"type": "pong"})
         elif msg["type"] == "pong":
             pass   
+        elif msg["type"] == "handoff":
+            if sender is not None:
+                self.receive(msg["key"], msg["value"], msg["clock"])
+                self.transport.send(sender, {
+                    "type": "handoff_ack",
+                    "hint_id": msg["hint_id"],
+                })
+
+        elif msg["type"] == "handoff_ack":
+            hint_id = msg["hint_id"]
+            hint = self.hints.get(hint_id)
+            if hint is not None and sender == hint["home"]:
+                del self.hints[hint_id]
         else:
             raise ValueError(f"Unknown message type in {msg!r}")
         
@@ -316,6 +330,20 @@ class NodeDynamo:
     def on_gossip_tick(self) -> None:
         self.gossip_once()
         self.scheduler.call_later(self.gossip_interval_ms, self.on_gossip_tick)
+    
+    def send_pending_hints(self) -> None:
+        for hint_id, hint in list(self.hints.items()):
+            home = hint["home"]
+            if home in self.suspected_nodes:
+                continue
+
+            self.transport.send(home, {
+                "type": "handoff",
+                "hint_id": hint_id,
+                "key": hint["key"],
+                "value": hint["value"],
+                "clock": hint["clock"],
+            })
 
     def on_health_check_tick(self) -> None:
         time = self.scheduler.now_ms()
@@ -326,6 +354,7 @@ class NodeDynamo:
             if time - last_seen >= self.failure_timeout_ms:
                 self.suspected_nodes.add(peer)
             self.transport.send(peer, {"type": "ping"})
+        self.send_pending_hints()
         self.scheduler.call_later(
             self.health_check_interval_ms,
             self.on_health_check_tick,
